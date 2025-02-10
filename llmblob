@@ -1,0 +1,185 @@
+#!/usr/bin/env uv run --script --no-project
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ['tiktoken', 'pathspec']
+# ///
+
+from __future__ import annotations
+import sys
+import os
+import argparse
+from typing import List, Dict, Any, Optional
+from pathspec import PathSpec
+import tiktoken
+
+
+def load_ignore_patterns(filename: str) -> List[str]:
+    patterns: List[str] = []
+    if os.path.isfile(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+    return patterns
+
+
+def is_text_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(2048)
+        chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def build_tree(paths: List[str]) -> Dict[str, Any]:
+    tree: Dict[str, Any] = {}
+    for path in sorted(paths):
+        parts = path.split(os.sep)
+        node = tree
+        for part in parts:
+            if part not in node:
+                node[part] = {}
+            node = node[part]
+    return tree
+
+
+def format_tree(tree: Dict[str, Any], prefix: str = "") -> str:
+    lines: List[str] = []
+    items = list(tree.items())
+    for idx, (name, subtree) in enumerate(items):
+        connector = "└── " if idx == len(items) - 1 else "├── "
+        lines.append(f"{prefix}{connector}{name}")
+        if subtree:
+            extension = "    " if idx == len(items) - 1 else "│   "
+            lines.extend(format_tree(subtree, prefix + extension).splitlines())
+    return "\n".join(lines)
+
+
+def load_prompts(prompt_names: List[str]) -> List[str]:
+    prompts: List[str] = []
+    for name in prompt_names:
+        file_name = f"{name}.prompt"
+        local_path = os.path.join(".llmprompt", file_name)
+        global_path = os.path.join(os.path.expanduser("~"), ".llmprompt", file_name)
+        path_to_use: Optional[str] = (
+            local_path if os.path.exists(local_path) else global_path if os.path.exists(global_path) else None
+        )
+        if path_to_use:
+            try:
+                with open(path_to_use, "r", encoding="utf-8") as f:
+                    prompts.append(f.read())
+            except Exception:
+                continue
+    return prompts
+
+
+def load_cursorrules() -> str:
+    local_path = os.path.join(".llmprompt", ".cursorrules")
+    global_path = os.path.join(os.path.expanduser("~"), ".llmprompt", ".cursorrules")
+    path_to_use: Optional[str] = None
+    if os.path.exists(local_path):
+        path_to_use = local_path
+    elif os.path.exists(global_path):
+        path_to_use = global_path
+    if path_to_use:
+        try:
+            with open(path_to_use, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return ""
+    return ""
+
+
+def estimate_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        action="append",
+        help="Prompt file names (without extension) to load from .llmprompt or ~/.llmprompt",
+    )
+    parser.add_argument(
+        "--no-cursorrules",
+        action="store_true",
+        help="Disable automatic inclusion of .cursorrules",
+    )
+    parser.add_argument(
+        "--user-prompt",
+        type=str,
+        help="User prompt to append to the outputs",
+    )
+    parser.add_argument(
+        "--stdin-user-prompt",
+        action="store_true",
+        help="Read user prompt from stdin after the script is launched",
+    )
+    args = parser.parse_args()
+
+    prompt_texts: List[str] = []
+    if not args.no_cursorrules:
+        cursorrules = load_cursorrules()
+        if cursorrules:
+            prompt_texts.append(cursorrules)
+    if args.prompt:
+        prompt_texts.extend(load_prompts(args.prompt))
+    if args.user_prompt:
+        prompt_texts.append(args.user_prompt)
+    if args.stdin_user_prompt:
+        user_input: str = sys.stdin.read()
+        if user_input.strip():
+            prompt_texts.append(user_input)
+
+    print("Building llmblob", file=sys.stderr)
+
+    gitignore_patterns = load_ignore_patterns(".gitignore")
+    llmignore_patterns = load_ignore_patterns(".llmignore")
+    all_patterns = gitignore_patterns + llmignore_patterns
+    spec = PathSpec.from_lines("gitwildmatch", all_patterns)
+
+    included_files: List[str] = []
+    file_contents: List[str] = []
+    for root, dirs, files in os.walk("."):
+        print("walking", root, file=sys.stderr)
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for file_name in files:
+            rel_path = os.path.relpath(os.path.join(root, file_name), ".")
+            if spec.match_file(rel_path):
+                continue
+            included_files.append(rel_path)
+            full_path = os.path.join(root, file_name)
+            if not is_text_file(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    contents = f.read()
+                file_contents.append(f"File: {rel_path}\n---\n{contents}\n")
+            except Exception:
+                continue
+
+    tree = build_tree(included_files)
+    ascii_diagram = format_tree(tree)
+
+    full_blob = "\n".join(file_contents)
+    combined_output = "\n".join(prompt_texts) + "\n" + ascii_diagram + "\n" + full_blob
+    print("\n".join(prompt_texts))
+    print("The following is an ASCII tree diagram of the files in the repository and their structure")
+    print(ascii_diagram)
+    print("The following is the contents of the files in the repository")
+    print(full_blob)
+    token_estimate = estimate_tokens(full_blob)
+
+    print(included_files, file=sys.stderr)
+    print(token_estimate, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

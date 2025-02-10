@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+
+Operation = Dict[str, Any]
+OperationsJSON = Dict[str, Any]
+
+def load_operations_from_stdin() -> List[Operation]:
+    data: OperationsJSON = json.load(sys.stdin)
+    return data.get("operations", [])
+
+def apply_operation(op: Operation) -> None:
+    operation: str = op.get("operation")
+    file_path_str: str = op.get("file_path")
+    file_path: Path = Path(file_path_str)
+
+    if operation in ("create", "update"):
+        content: str = op.get("content", "")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+        print(f"{operation.capitalize()}d {file_path}")
+    elif operation == "delete":
+        if file_path.exists():
+            file_path.unlink()
+            print(f"Deleted {file_path}")
+        else:
+            print(f"File {file_path} not found for deletion")
+    else:
+        print(f"Unknown operation: {operation} for file {file_path}")
+
+def main() -> None:
+    operations = load_operations_from_stdin()
+    for op in operations:
+        apply_operation(op)
+
+if __name__ == "__main__":
+    main()
